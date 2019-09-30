@@ -1,5 +1,5 @@
-#ifndef GMATRIX_H_
-#define GMATRIX_H_
+#ifndef GMAScalarRIX_H_
+#define GMAScalarRIX_H_
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -8,247 +8,182 @@
 
 namespace gpu {
 
+template <typename Scalar, int Rows, int Cols>
 class Matrix {
 public:
-	CUDAH Matrix();
+	CUDAH Matrix() {
+		offset_ = 0;
+		buffer_ = NULL;
+		is_copied_ = false;
+	}
 
-	CUDAH Matrix(int rows, int cols, int offset, double *buffer);
+	CUDAH Matrix(int offset, Scalar *buffer) {
+		offset_ = offset;
+		buffer_ = buffer;
+		is_copied_ = true;
+	}
 
-	CUDAH int rows() const;
+	CUDAH Matrix(const Matrix<Scalar> &other) {
+		offset_ = other.offset_;
+		buffer_ = other.buffer_;
+		is_copied_ = true;
+	}
 
-	CUDAH int cols() const;
+	CUDAH Matrix(Matrix<Scalar> &&other) {
+		offset_ = other.offset_;
+		buffer_ = other.buffer_;
+		is_copied_ = false;
 
-	CUDAH int offset() const;
+		other.offset_ = 0;
+		other.buffer_ = NULL;
+		other.is_copied_ = true;
+	}
 
-	CUDAH double *buffer() const;
+	CUDAH int rows() const { return Rows; }
+	CUDAH int cols() const { return Cols; }
+	CUDAH int offset() const { return offset_; }
 
-	CUDAH void setRows(int rows);
-	CUDAH void setCols(int cols);
-	CUDAH void setOffset(int offset);
-	CUDAH void setBuffer(double *buffer);
-	CUDAH void setCellVal(int row, int col, double val);
+	CUDAH Scalar *buffer() { return buffer_; }
 
-	CUDAH void copy(Matrix &output);
+	CUDAH void setOffset(int offset) { offset_ = offset; }
+	CUDAH void setBuffer(Scalar *buffer) { buffer_ = buffer;}
+	CUDAH void setCellVal(int row, int col, Scalar val) {
+		buffer_[(row * Cols + col) * offset_] = val;
+	}
 
-	//Need to fix. Only reducing rows is OK now.
-	CUDAH void resize(int rows, int cols);
-
-	CUDAH double *cellAddr(int row, int col);
-
-	CUDAH double *cellAddr(int index);
+	// Deep copy to output
+	CUDAH void copy_from(const Matrix<Scalar, Rows, Cols> &output) {
+#pragma unroll 1
+		for (int i = 0; i < Rows; i++) {
+#pragma unroll 1
+			for (int j = 0; j < Cols; j++) {
+				buffer_[(i * cols_ + j) * offset_] = output.at(i, j);
+			}
+		}
+	}
 
 	//Assignment operator
-	CUDAH void operator=(const Matrix input);
+	// Copy assignment
+	CUDAH Matrix<Scalar, Rows, Cols>& operator=(const Matrix<Scalar, Rows, Cols> &input) {
+		offset_ = other.offset_;
+		buffer_ = other.buffer_;
+		is_copied_ = true;
 
-	CUDAH double& operator()(int row, int col);
+		return *this;
+	}
 
-	CUDAH void set(int row, int col, double val);
+	CUDAH Scalar at(int row, int col) const { return buffer_[(row * Cols + col) * offset_]; }
+	CUDAH Scalar at(int idx) const { return buffer_[idx * offset_]; }
 
-	CUDAH double& operator()(int index);
+	// Operators
+	CUDAH Scalar& operator()(int row, int col) { return buffer_[(row * Cols + col) * offset_]; }
+	CUDAH Scalar& operator()(int index) { return buffer_[idx * offset_]; }
 
-	CUDAH double at(int row, int col) const;
+	template <typename Scalar2>
+	CUDAH Matrix<Scalar, Rows, Cols>& operator*=(Scalar2 val) {
+#pragma unroll 1
+		for (int i = 0; i < Rows; i++) {
+#pragma unroll 1
+			for (int j = 0; j < Cols; j++) {
+				buffer_[(i * Cols + j) * offset_] *= val;
+			}
+		}
 
-	CUDAH bool operator*=(double val);
+		return *this;
+	}
 
-	CUDAH bool operator/=(double val);
+	template <typename Scalar2>
+	CUDAH Matrix<Scalar>& operator/=(Scalar2 val) {
+#pragma unroll 1
+		for (int i = 0; i < Rows; i++) {
+#pragma unroll 1
+			for (int j = 0; j < Cols; j++) {
+				buffer_[(i * Cols + j) * offset_] /= val;
+			}
+		}
 
-	CUDAH bool transpose(Matrix &output);
+		return *this;
+	}
+
+	CUDAH void transpose(Matrix<Scalar, Rows, Cols> &output) {
+		for (int i = 0; i < Rows; i++) {
+			for (int j = 0; j < Cols; j++) {
+				output(j, i) = buffer_[(i * Cols + j) * offset_];
+			}
+		}
+	}
 
 	//Only applicable for 3x3 matrix or below
-	CUDAH bool inverse(Matrix &output);
+	CUDAH bool inverse(Matrix<Scalar, Rows, Cols> &output);
 
-	CUDAH Matrix col(int index);
+	CUDAH Scalar dot(const Matrix<Scalar, Rows, Cols> &other) {
+		Scalar res = 0;
 
-	CUDAH Matrix row(int index);
+#pragma unroll 1
+		for (int i = 0; i < Rows; i++) {
+#pragma unroll 1
+			for (int j = 0; j < Cols; j++) {
+				res += buffer_[(i * Rows + j) * offset_] * other.at(i, j);
+			}
+		}
+
+		return res;
+	}
+
+	CUDAH Matrix<Scalar, Rows, 1> col(int index) {
+		return Matrix<Scalar, Rows, 1>(offset_ * Cols, buffer_ + index * offset_);
+	}
+
+	CUDAH Matrix<Scalar, 1, Cols> row(int index) {
+		return Matrix<Scalar, 1, Cols>(offset_, buffer_ + index * cols_ * offset_);
+	}
+
+	// Extract a col of RSize elements from (row, col)
+	CUDAH Matrix<Scalar, RSize, 1> col(int row, int col) {
+		return Matrix<Scalar, RSize, 1>(offset_ * Cols, buffer_ + (row * Cols + col) * offset_);
+	}
+
+	// Extract a row of CSize elements from (row, col)
+	CUDAH Matrix<Scalar, 1, CSize> row(int row, int col) {
+		return Matrix<Scalar, 1, CSize>(offset_, buffer_ + (row * Cols + col) * offset_);
+	}
 
 protected:
-	double *buffer_;
-	int rows_, cols_, offset_;
+	Scalar *buffer_;
+	int offset_;
+	bool is_copied_;	// True: free buffer after being used, false: do nothing
 };
 
+template <>
+CUDAH bool Matrix<double, 3, 3>::inverse(Matrix<double, 3, 3> &output)
+{
+	double det = at(0, 0) * at(1, 1) * at(2, 2) + at(0, 1) * at(1, 2) * at(2, 0) + at(1, 0) * at (2, 1) * at(0, 2)
+					- at(0, 2) * at(1, 1) * at(2, 0) - at(0, 1) * at(1, 0) * at(2, 2) - at(0, 0) * at(1, 2) * at(2, 1);
 
-CUDAH Matrix::Matrix() {
-	buffer_ = NULL;
-	rows_ = cols_ = offset_ = 0;
-}
+	double idet = 1.0 / det;
 
-CUDAH Matrix::Matrix(int rows, int cols, int offset, double *buffer) {
-	rows_ = rows;
-	cols_ = cols;
-	offset_ = offset;
-	buffer_ = buffer;
-}
+	if (det != 0) {
+		output(0, 0) = (at(1, 1) * at(2, 2) - at(1, 2) * at(2, 1)) * idet;
+		output(0, 1) = - (at(0, 1) * at(2, 2) - at(0, 2) * at(2, 1)) * idet;
+		output(0, 2) = (at(0, 1) * at(1, 2) - at(0, 2) * at(1, 1)) * idet;
 
-CUDAH int Matrix::rows() const {
-	return rows_;
-}
+		output(1, 0) = - (at(1, 0) * at(2, 2) - at(1, 2) * at(2, 0)) * idet;
+		output(1, 1) = (at(0, 0) * at(2, 2) - at(0, 2) * at(2, 0)) * idet;
+		output(1, 2) = - (at(0, 0) * at(1, 2) - at(0, 2) * at(1, 0)) * idet;
 
-CUDAH int Matrix::cols() const {
-	return cols_;
-}
+		output(2, 0) = (at(1, 0) * at(2, 1) - at(1, 1) * at(2, 0)) * idet;
+		output(2, 1) = - (at(0, 0) * at(2, 1) - at(0, 1) * at(2, 0)) * idet;
+		output(2, 2) = (at(0, 0) * at(1, 1) - at(0, 1) * at(1, 0)) * idet;
 
-CUDAH int Matrix::offset() const {
-	return offset_;
-}
-
-CUDAH double *Matrix::buffer() const {
-	return buffer_;
-}
-
-CUDAH void Matrix::setRows(int rows) { rows_ = rows; }
-CUDAH void Matrix::setCols(int cols) { cols_ = cols; }
-CUDAH void Matrix::setOffset(int offset) { offset_ = offset; }
-CUDAH void Matrix::setBuffer(double *buffer) { buffer_ = buffer; }
-CUDAH void Matrix::setCellVal(int row, int col, double val) {
-	buffer_[(row * cols_ + col) * offset_] = val;
-}
-
-CUDAH void Matrix::copy(Matrix &output) {
-	for (int i = 0; i < rows_; i++) {
-		for (int j = 0; j < cols_; j++) {
-			output(i, j) = buffer_[(i * cols_ + j) * offset_];
-		}
-	}
-}
-
-//Need to fix. Only reducing rows is OK now.
-CUDAH void Matrix::resize(int rows, int cols) {
-	rows_ = rows;
-	cols_ = cols;
-}
-
-CUDAH double *Matrix::cellAddr(int row, int col) {
-	if (row >= rows_ || col >= cols_ || row < 0 || col < 0)
-		return NULL;
-
-	return buffer_ + (row * cols_ + col) * offset_;
-}
-
-CUDAH double *Matrix::cellAddr(int index) {
-	if (rows_ == 1 && index >= 0 && index < cols_) {
-			return buffer_ + index * offset_;
-	}
-	else if (cols_ == 1 && index >= 0 && index < rows_) {
-			return buffer_ + index * offset_;
-	}
-
-	return NULL;
-}
-
-//Assignment operator
-CUDAH void Matrix::operator=(const Matrix input) {
-	rows_ = input.rows_;
-	cols_ = input.cols_;
-	offset_ = input.offset_;
-	buffer_ = input.buffer_;
-}
-
-CUDAH double& Matrix::operator()(int row, int col) {
-	return buffer_[(row * cols_ + col) * offset_];
-}
-
-CUDAH void Matrix::set(int row, int col, double val) {
-	buffer_[(row * cols_ + col) * offset_] = val;
-}
-
-CUDAH double& Matrix::operator()(int index) {
-	return buffer_[index * offset_];
-}
-
-CUDAH double Matrix::at(int row, int col) const {
-	return buffer_[(row * cols_ + col) * offset_];
-}
-
-CUDAH bool Matrix::operator*=(double val) {
-	for (int i = 0; i < rows_; i++) {
-		for (int j = 0; j < cols_; j++) {
-			buffer_[(i * cols_ + j) * offset_] *= val;
-		}
-	}
-
-	return true;
-}
-
-CUDAH bool Matrix::operator/=(double val) {
-	if (val == 0)
+		return true;
+	} else
 		return false;
-
-	for (int i = 0; i < rows_ * cols_; i++) {
-			buffer_[i * offset_] /= val;
-	}
-
-	return true;
 }
 
-CUDAH bool Matrix::transpose(Matrix &output) {
-	if (rows_ != output.cols_ || cols_ != output.rows_)
-		return false;
 
-	for (int i = 0; i < rows_; i++) {
-		for (int j = 0; j < cols_; j++) {
-			output(j, i) = buffer_[(i * cols_ + j) * offset_];
-		}
-	}
-
-	return true;
-}
-
-//Only applicable for 3x3 matrix or below
-CUDAH bool Matrix::inverse(Matrix &output) {
-	if (rows_ != cols_ || rows_ == 0 || cols_ == 0)
-		return false;
-
-	if (rows_ == 1) {
-		if (buffer_[0] != 0)
-			output(0, 0) = 1 / buffer_[0];
-		else
-			return false;
-	}
-
-	if (rows_ == 2) {
-		double det = at(0, 0) * at(1, 1) - at(0, 1) * at(1, 0);
-
-		if (det != 0) {
-			output(0, 0) = at(1, 1) / det;
-			output(0, 1) = - at(0, 1) / det;
-
-			output(1, 0) = - at(1, 0) / det;
-			output(1, 1) = at(0, 0) / det;
-		} else
-			return false;
-	}
-
-	if (rows_ == 3) {
-		double det = at(0, 0) * at(1, 1) * at(2, 2) + at(0, 1) * at(1, 2) * at(2, 0) + at(1, 0) * at (2, 1) * at(0, 2)
-						- at(0, 2) * at(1, 1) * at(2, 0) - at(0, 1) * at(1, 0) * at(2, 2) - at(0, 0) * at(1, 2) * at(2, 1);
-		double idet = 1.0 / det;
-
-		if (det != 0) {
-			output(0, 0) = (at(1, 1) * at(2, 2) - at(1, 2) * at(2, 1)) * idet;
-			output(0, 1) = - (at(0, 1) * at(2, 2) - at(0, 2) * at(2, 1)) * idet;
-			output(0, 2) = (at(0, 1) * at(1, 2) - at(0, 2) * at(1, 1)) * idet;
-
-			output(1, 0) = - (at(1, 0) * at(2, 2) - at(1, 2) * at(2, 0)) * idet;
-			output(1, 1) = (at(0, 0) * at(2, 2) - at(0, 2) * at(2, 0)) * idet;
-			output(1, 2) = - (at(0, 0) * at(1, 2) - at(0, 2) * at(1, 0)) * idet;
-
-			output(2, 0) = (at(1, 0) * at(2, 1) - at(1, 1) * at(2, 0)) * idet;
-			output(2, 1) = - (at(0, 0) * at(2, 1) - at(0, 1) * at(2, 0)) * idet;
-			output(2, 2) = (at(0, 0) * at(1, 1) - at(0, 1) * at(1, 0)) * idet;
-		} else
-			return false;
-	}
-
-	return true;
-}
-
-CUDAH Matrix Matrix::col(int index) {
-	return Matrix(rows_, 1, offset_ * cols_, buffer_ + index * offset_);
-}
-
-CUDAH Matrix Matrix::row(int index) {
-	return Matrix(1, cols_, offset_, buffer_ + index * cols_ * offset_);
-}
+template class Matrix<float, 3, 1>;
+template class Matrix<double, 3, 1>;
+template class Matrix<double, 3, 3>;
 
 }
 

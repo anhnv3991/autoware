@@ -17,17 +17,12 @@
 #include <sys/time.h>
 
 #include "ndt_gpu/SymmetricEigenSolver.h"
+#include "ndt_gpu/VectorRegister.h"
 
 namespace gpu {
 
 GVoxelGrid::GVoxelGrid():
-	x_(NULL),
-	y_(NULL),
-	z_(NULL),
 	points_num_(0),
-	centroid_(NULL),
-	covariance_(NULL),
-	inverse_covariance_(NULL),
 	points_per_voxel_(NULL),
 	voxel_num_(0),
 	max_x_(FLT_MAX),
@@ -58,10 +53,7 @@ GVoxelGrid::GVoxelGrid():
 
 GVoxelGrid::GVoxelGrid(const GVoxelGrid &other)
 {
-	x_ = other.x_;
-	y_ = other.y_;
-	z_ = other.z_;
-
+	input_cloud_ = other.input_cloud_;
 	points_num_ = other.points_num_;
 
 	centroid_ = other.centroid_;
@@ -108,10 +100,8 @@ GVoxelGrid::~GVoxelGrid() {
 	if (!is_copied_) {
 
 		for (unsigned int i = 1; i < octree_centroids_.size(); i++) {
-			if (octree_centroids_[i] != NULL) {
-				checkCudaErrors(cudaFree(octree_centroids_[i]));
-				octree_centroids_[i] = NULL;
-			}
+			octree_centroids_[i].free();
+
 			if (octree_points_per_node_[i] != NULL) {
 				checkCudaErrors(cudaFree(octree_points_per_node_[i]));
 				octree_points_per_node_[i] = NULL;
@@ -132,20 +122,9 @@ GVoxelGrid::~GVoxelGrid() {
 			point_ids_ = NULL;
 		}
 
-		if (centroid_ != NULL) {
-			checkCudaErrors(cudaFree(centroid_));
-			centroid_ = NULL;
-		}
-
-		if (covariance_ != NULL) {
-			checkCudaErrors(cudaFree(covariance_));
-			covariance_ = NULL;
-		}
-
-		if (inverse_covariance_ != NULL) {
-			checkCudaErrors(cudaFree(inverse_covariance_));
-			inverse_covariance_ = NULL;
-		}
+		centroid_.free();
+		covariance_.free();
+		inverse_covariance_.free();
 
 		if (points_per_voxel_ != NULL) {
 			checkCudaErrors(cudaFree(points_per_voxel_));
@@ -157,32 +136,20 @@ GVoxelGrid::~GVoxelGrid() {
 
 void GVoxelGrid::initialize()
 {
-	if (centroid_ != NULL) {
-		checkCudaErrors(cudaFree(centroid_));
-		centroid_ = NULL;
-	}
 
-	if (covariance_ != NULL) {
-		checkCudaErrors(cudaFree(covariance_));
-		covariance_ = NULL;
-	}
-
-	if (inverse_covariance_ != NULL) {
-		checkCudaErrors(cudaFree(inverse_covariance_));
-		inverse_covariance_ = NULL;
-	}
+	centroid_.free();
+	covariance_.free();
+	inverse_covariance_.free();
 
 	if (points_per_voxel_ != NULL) {
 		checkCudaErrors(cudaFree(points_per_voxel_));
 		points_per_voxel_ = NULL;
 	}
 
-	checkCudaErrors(cudaMalloc(&centroid_, sizeof(double) * 3 * voxel_num_));
-	checkCudaErrors(cudaMalloc(&covariance_, sizeof(double) * 9 * voxel_num_));
-	checkCudaErrors(cudaMalloc(&inverse_covariance_, sizeof(double) * 9 * voxel_num_));
-	checkCudaErrors(cudaMalloc(&points_per_voxel_, sizeof(int) * voxel_num_));
+	centroid_ = std::move(MatrixDeviceList<double>(3, 1, voxel_num_));
+	covariance_ = std::move(MatrixDeviceList<double>(3, 3, voxel_num_));
+	inverse_covariance_ = std::move(MatrixDeviceList<double>(3, 3, voxel_num_));
 
-	checkCudaErrors(cudaMemset(inverse_covariance_, 0, sizeof(double) * 9 * voxel_num_));
 	checkCudaErrors(cudaMemset(points_per_voxel_, 0, sizeof(int) * voxel_num_));
 	checkCudaErrors(cudaDeviceSynchronize());
 }
@@ -284,17 +251,17 @@ void GVoxelGrid::setLeafSize(float voxel_x, float voxel_y, float voxel_z)
 	voxel_z_ = voxel_z;
 }
 
-double* GVoxelGrid::getCentroidList() const
+MatrixDeviceList<double> GVoxelGrid::getCentroidList() const
 {
 	return centroid_;
 }
 
-double* GVoxelGrid::getCovarianceList() const
+MatrixDeviceList<double> GVoxelGrid::getCovarianceList() const
 {
 	return covariance_;
 }
 
-double* GVoxelGrid::getInverseCovarianceList() const
+MatrixDeviceList<double> GVoxelGrid::getInverseCovarianceList() const
 {
 	return inverse_covariance_;
 }
@@ -305,10 +272,10 @@ int* GVoxelGrid::getPointsPerVoxelList() const
 }
 
 
-extern "C" __device__ int voxelId(float x, float y, float z,
-									float voxel_x, float voxel_y, float voxel_z,
-									int min_b_x, int min_b_y, int min_b_z,
-									int vgrid_x, int vgrid_y, int vgrid_z)
+__device__ int voxelId(float x, float y, float z,
+							float voxel_x, float voxel_y, float voxel_z,
+							int min_b_x, int min_b_y, int min_b_z,
+							int vgrid_x, int vgrid_y, int vgrid_z)
 {
 	int id_x = static_cast<int>(floorf(x / voxel_x) - static_cast<float>(min_b_x));
 	int id_y = static_cast<int>(floorf(y / voxel_y) - static_cast<float>(min_b_y));
@@ -318,15 +285,16 @@ extern "C" __device__ int voxelId(float x, float y, float z,
 }
 
 /* First step to compute centroids and covariances of voxels. */
-extern "C" __global__ void initCentroidAndCovariance(float *x, float *y, float *z, int *starting_point_ids, int *point_ids,
-														double *centroids, double *covariances, int voxel_num)
+__global__ void initCentroidAndCovariance(MatrixDeviceList<float> cloud, int *starting_point_ids, int *point_ids,
+											MatrixDeviceList<double> centroids, MatrixDeviceList<double> covariances,
+											int voxel_num)
 {
 	int idx = threadIdx.x + blockIdx.x * blockDim.x;
 	int stride = blockDim.x * gridDim.x;
 
 	for (int i = idx; i < voxel_num; i += stride) {
-		MatrixDevice centr(3, 1, voxel_num, centroids + i);
-		MatrixDevice cov(3, 3, voxel_num, covariances + i);
+		MatrixDevice<double> centr = centroids(i);
+		MatrixDevice<double> cov = covariances(i);
 
 		double centr0, centr1, centr2;
 		double cov00, cov01, cov02, cov11, cov12, cov22;
@@ -337,9 +305,10 @@ extern "C" __global__ void initCentroidAndCovariance(float *x, float *y, float *
 
 		for (int j = starting_point_ids[i]; j < starting_point_ids[i + 1]; j++) {
 			int pid = point_ids[j];
-			double t_x = static_cast<double>(x[pid]);
-			double t_y = static_cast<double>(y[pid]);
-			double t_z = static_cast<double>(z[pid]);
+			MatrixDevice<float> p = cloud(pid);
+			double t_x = static_cast<double>(p(0));
+			double t_y = static_cast<double>(p(1));
+			double t_z = static_cast<double>(p(2));
 
 			centr0 += t_x;
 			centr1 += t_y;
@@ -367,13 +336,13 @@ extern "C" __global__ void initCentroidAndCovariance(float *x, float *y, float *
 }
 
 /* Update centroids of voxels. */
-extern "C" __global__ void updateVoxelCentroid(double *centroid, int *points_per_voxel, int voxel_num)
+__global__ void updateVoxelCentroid(MatrixDeviceList<double> centroid, int *points_per_voxel, int voxel_num)
 {
 	int index = threadIdx.x + blockIdx.x * blockDim.x;
 	int stride = blockDim.x * gridDim.x;
 
 	for (int vid = index; vid < voxel_num; vid += stride) {
-		MatrixDevice centr(3, 1, voxel_num, centroid + vid);
+		MatrixDevice<double> centr = centroid(vid);
 		double points_num = static_cast<double>(points_per_voxel[vid]);
 
 		if (points_num > 0) {
@@ -383,23 +352,15 @@ extern "C" __global__ void updateVoxelCentroid(double *centroid, int *points_per
 }
 
 /* Update covariance of voxels. */
-extern "C" __global__ void updateVoxelCovariance(double *centroid, double *pt_sum, double *covariance, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
+__global__ void updateVoxelCovariance(MatrixDeviceList<double> centroid, MatrixDeviceList<double> pt_sum,
+										MatrixDeviceList<double> covariance, int *points_per_voxel,
+										int voxel_num, int min_points_per_voxel)
 {
-	int index = threadIdx.x + blockIdx.x * blockDim.x;
-	int stride = blockDim.x * gridDim.x;
-
-	for (int vid = index; vid < voxel_num; vid += stride) {
-		MatrixDevice centr(3, 1, voxel_num, centroid + vid);
-		MatrixDevice cov(3, 3, voxel_num, covariance + vid);
-		MatrixDevice pts(3, 1, voxel_num, pt_sum + vid);
+	for (int vid = threadIdx.x + blockIdx.x * blockDim.x; vid < voxel_num; vid += blockDim.x * gridDim.x) {
+		VectorR<double> c = centroid(vid);
+		MatrixDevice<double> cov = covariance(vid);
+		VectorR<double> p = pt_sum(vid);
 		double points_num = static_cast<double>(points_per_voxel[vid]);
-
-		double c0 = centr(0);
-		double c1 = centr(1);
-		double c2 = centr(2);
-		double p0 = pts(0);
-		double p1 = pts(1);
-		double p2 = pts(2);
 
 		points_per_voxel[vid] = (points_num < min_points_per_voxel) ? 0 : points_num;
 
@@ -407,20 +368,23 @@ extern "C" __global__ void updateVoxelCovariance(double *centroid, double *pt_su
 
 			double mult = (points_num - 1.0) / points_num;
 
-			cov(0, 0) = ((cov(0, 0) - 2.0 * p0 * c0) / points_num + c0 * c0) * mult;
-			cov(0, 1) = ((cov(0, 1) - 2.0 * p0 * c1) / points_num + c0 * c1) * mult;
-			cov(0, 2) = ((cov(0, 2) - 2.0 * p0 * c2) / points_num + c0 * c2) * mult;
+			for (int i = 0; i < cov.rows(); i++) {
+				for (int j = i; j < cov.cols(); j++) {
+					cov(i, j) = ((cov(i, j) - 2.0 * p(i) * c(j)) / points_num + c(i) * c(j)) * mult;
+				}
+			}
+
 			cov(1, 0) = cov(0, 1);
-			cov(1, 1) = ((cov(1, 1) - 2.0 * p1 * c1) / points_num + c1 * c1) * mult;
-			cov(1, 2) = ((cov(1, 2) - 2.0 * p1 * c2) / points_num + c1 * c2) * mult;
 			cov(2, 0) = cov(0, 2);
 			cov(2, 1) = cov(1, 2);
-			cov(2, 2) = ((cov(2, 2) - 2.0 * p2 * c2) / points_num + c2 * c2) * mult;
 		}
 	}
 }
 
-extern "C" __global__ void computeInverseEigenvectors(double *inverse_covariance, int *points_per_voxel, int voxel_num, double *eigenvectors, int min_points_per_voxel)
+__global__ void computeInverseEigenvectors(MatrixDeviceList<double> inverse_covariance,
+											int *points_per_voxel, int voxel_num,
+											MatrixDeviceList<double> eigenvectors,
+											int min_points_per_voxel)
 {
 
 	int index = threadIdx.x + blockIdx.x * blockDim.x;
@@ -428,8 +392,8 @@ extern "C" __global__ void computeInverseEigenvectors(double *inverse_covariance
 
 	for (int vid = index; vid < voxel_num; vid += stride) {
 		if (points_per_voxel[vid] >= min_points_per_voxel) {
-			MatrixDevice icov(3, 3, voxel_num, inverse_covariance + vid);
-			MatrixDevice eigen_vectors(3, 3, voxel_num, eigenvectors + vid);
+			MatrixDevice<double> icov = inverse_covariance(vid);
+			MatrixDevice<double> eigen_vectors = eigenvectors(vid);
 
 			eigen_vectors.inverse(icov);
 		}
@@ -440,7 +404,8 @@ extern "C" __global__ void computeInverseEigenvectors(double *inverse_covariance
 
 //eigen_vecs = eigen_vecs * eigen_val
 
-extern "C" __global__ void updateCovarianceS0(int *points_per_voxel, int voxel_num, double *eigenvalues, double *eigenvectors, int min_points_per_voxel)
+__global__ void updateCovarianceS0(int *points_per_voxel, int voxel_num, MatrixDeviceList<double> eigenvalues,
+									MatrixDeviceList<double> eigenvectors, int min_points_per_voxel)
 {
 
 	int index = threadIdx.x + blockIdx.x * blockDim.x;
@@ -448,11 +413,11 @@ extern "C" __global__ void updateCovarianceS0(int *points_per_voxel, int voxel_n
 
 	for (int vid = index; vid < voxel_num; vid += stride) {
 		if (points_per_voxel[vid] >= min_points_per_voxel) {
-			MatrixDevice eigen_vectors(3, 3, voxel_num, eigenvectors + vid);
+			MatrixDevice<double> eigen_vectors = eigenvectors(vid);
 
-			double eig_val0 = eigenvalues[vid];
-			double eig_val1 = eigenvalues[vid + voxel_num];
-			double eig_val2 = eigenvalues[vid + 2 * voxel_num];
+			double eig_val0 = eigenvalues(vid)(0);
+			double eig_val1 = eigenvalues(vid)(1);
+			double eig_val2 = eigenvalues(vid)(2);
 
 			eigen_vectors(0, 0) *= eig_val0;
 			eigen_vectors(1, 0) *= eig_val0;
@@ -472,8 +437,11 @@ extern "C" __global__ void updateCovarianceS0(int *points_per_voxel, int voxel_n
 }
 
 //cov = new eigen_vecs * eigen_vecs transpose
-
-extern "C" __global__ void updateCovarianceS1(double *covariance, double *inverse_covariance, int *points_per_voxel, int voxel_num, double *eigenvectors, int min_points_per_voxel, int col)
+__global__ void updateCovarianceS1(MatrixDeviceList<double> covariance,
+									MatrixDeviceList<double> inverse_covariance,
+									int *points_per_voxel, int voxel_num,
+									MatrixDeviceList<double> eigenvectors,
+									int min_points_per_voxel, int col)
 {
 
 	int index = threadIdx.x + blockIdx.x * blockDim.x;
@@ -481,24 +449,21 @@ extern "C" __global__ void updateCovarianceS1(double *covariance, double *invers
 
 	for (int vid = index; vid < voxel_num; vid += stride) {
 		if (points_per_voxel[vid] >= min_points_per_voxel) {
-			MatrixDevice cov(3, 3, voxel_num, covariance + vid);
-			MatrixDevice icov(3, 3, voxel_num, inverse_covariance + vid);
-			MatrixDevice eigen_vectors(3, 3, voxel_num, eigenvectors + vid);
+			MatrixDevice<double> cov = covariance(vid);
+			MatrixDevice<double> evec = eigenvectors(vid);
+			VectorR<double> tmp = inverse_covariance(vid).col(col);
 
-			double tmp0 = icov(0, col);
-			double tmp1 = icov(1, col);
-			double tmp2 = icov(2, col);
-
-			cov(0, col) = eigen_vectors(0, 0) * tmp0 + eigen_vectors(0, 1) * tmp1 + eigen_vectors(0, 2) * tmp2;
-			cov(1, col) = eigen_vectors(1, 0) * tmp0 + eigen_vectors(1, 1) * tmp1 + eigen_vectors(1, 2) * tmp2;
-			cov(2, col) = eigen_vectors(2, 0) * tmp0 + eigen_vectors(2, 1) * tmp1 + eigen_vectors(2, 2) * tmp2;
+			for (int i = 0; i < evec.rows(); i++) {
+				cov(i, col) = tmp.dot(evec.row(i));
+			}
 		}
 
 		__syncthreads();
 	}
 }
 
-extern "C" __global__ void computeInverseCovariance(double *covariance, double *inverse_covariance, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
+__global__ void computeInverseCovariance(double *covariance, double *inverse_covariance,
+											int *points_per_voxel, int voxel_num, int min_points_per_voxel)
 {
 
 	int index = threadIdx.x + blockIdx.x * blockDim.x;
@@ -506,8 +471,8 @@ extern "C" __global__ void computeInverseCovariance(double *covariance, double *
 
 	for (int vid = index; vid < voxel_num; vid += stride) {
 		if (points_per_voxel[vid] >= min_points_per_voxel) {
-			MatrixDevice cov(3, 3, voxel_num, covariance + vid);
-			MatrixDevice icov(3, 3, voxel_num, inverse_covariance + vid);
+			MatrixDevice<double> cov(3, 3, voxel_num, covariance + vid);
+			MatrixDevice<double> icov(3, 3, voxel_num, inverse_covariance + vid);
 
 			cov.inverse(icov);
 		}
@@ -525,7 +490,7 @@ __global__ void init(T *input, int size, int local_size)
 	}
 }
 
-extern "C" __global__ void initBoolean(bool *input, int size)
+__global__ void initBoolean(bool *input, int size)
 {
 	for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < size; i += blockDim.x * gridDim.x) {
 		input[i] = (i % 2 == 0) ? true : false;
@@ -533,7 +498,7 @@ extern "C" __global__ void initBoolean(bool *input, int size)
 }
 
 /* Normalize input matrices to avoid overflow. */
-extern "C" __global__ void normalize(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
+__global__ void normalize(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
 {
 	for (int id = threadIdx.x + blockIdx.x * blockDim.x; id < voxel_num; id += blockDim.x * gridDim.x) {
 		if (points_per_voxel[id] >= min_points_per_voxel) {}
@@ -544,7 +509,7 @@ extern "C" __global__ void normalize(SymmetricEigensolver3x3 sv, int *points_per
 
 /* Compute eigenvalues. Eigenvalues are arranged in increasing order.
  * (eigen(0) <= eigen(1) <= eigen(2). */
-extern "C" __global__ void computeEigenvalues(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
+__global__ void computeEigenvalues(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
 {
 	for (int id = threadIdx.x + blockIdx.x * blockDim.x; id < voxel_num; id += blockDim.x * gridDim.x) {
 		if (points_per_voxel[id] >= min_points_per_voxel)
@@ -554,7 +519,7 @@ extern "C" __global__ void computeEigenvalues(SymmetricEigensolver3x3 sv, int *p
 }
 
 /* First step to compute eigenvector 0 of covariance matrices. */
-extern "C" __global__ void computeEvec00(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
+__global__ void computeEvec00(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
 {
 	for (int id = threadIdx.x + blockIdx.x * blockDim.x; id < voxel_num; id += blockDim.x * gridDim.x) {
 		if (points_per_voxel[id] >= min_points_per_voxel)
@@ -564,7 +529,7 @@ extern "C" __global__ void computeEvec00(SymmetricEigensolver3x3 sv, int *points
 }
 
 /* Second step to compute eigenvector 0 of covariance matrices. */
-extern "C" __global__ void computeEvec01(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
+__global__ void computeEvec01(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
 {
 	for (int id = threadIdx.x + blockIdx.x * blockDim.x; id < voxel_num; id += blockDim.x * gridDim.x) {
 		if (points_per_voxel[id] >= min_points_per_voxel)
@@ -574,7 +539,7 @@ extern "C" __global__ void computeEvec01(SymmetricEigensolver3x3 sv, int *points
 }
 
 /* First step to compute eigenvector 1 of covariance matrices. */
-extern "C" __global__ void computeEvec10(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
+__global__ void computeEvec10(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
 {
 	for (int id = threadIdx.x + blockIdx.x * blockDim.x; id < voxel_num; id += blockDim.x * gridDim.x) {
 		if (points_per_voxel[id] >= min_points_per_voxel)
@@ -584,7 +549,7 @@ extern "C" __global__ void computeEvec10(SymmetricEigensolver3x3 sv, int *points
 }
 
 /* Second step to compute eigenvector 1 of covariance matrices. */
-extern "C" __global__ void computeEvec11(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
+__global__ void computeEvec11(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
 {
 	for (int id = threadIdx.x + blockIdx.x * blockDim.x; id < voxel_num; id += blockDim.x * gridDim.x) {
 		if (points_per_voxel[id] >= min_points_per_voxel)
@@ -604,7 +569,7 @@ extern "C" __global__ void computeEvec2(SymmetricEigensolver3x3 sv, int *points_
 }
 
 /* Final step to compute eigenvalues. */
-extern "C" __global__ void updateEval(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
+__global__ void updateEval(SymmetricEigensolver3x3 sv, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
 {
 	for (int id = threadIdx.x + blockIdx.x * blockDim.x; id < voxel_num; id += blockDim.x * gridDim.x) {
 		if (points_per_voxel[id] >= min_points_per_voxel)
@@ -614,11 +579,12 @@ extern "C" __global__ void updateEval(SymmetricEigensolver3x3 sv, int *points_pe
 }
 
 /* Update eigenvalues in the case covariance matrix is nearly singular. */
-extern "C" __global__ void updateEval2(double *eigenvalues, int *points_per_voxel, int voxel_num, int min_points_per_voxel)
+__global__ void updateEval2(MatrixDeviceList<double> eigenvalues,
+								int *points_per_voxel, int voxel_num, int min_points_per_voxel)
 {
 	for (int id = threadIdx.x + blockIdx.x * blockDim.x; id < voxel_num; id += blockDim.x * gridDim.x) {
 		if (points_per_voxel[id] >= min_points_per_voxel) {
-			MatrixDevice eigen_val(3, 1, voxel_num, eigenvalues + id);
+			MatrixDevice<double> eigen_val = eigenvalues(id);
 			double ev0 = eigen_val(0);
 			double ev1 = eigen_val(1);
 			double ev2 = eigen_val(2);
@@ -653,15 +619,13 @@ void GVoxelGrid::computeCentroidAndCovariance()
 	int block_x = (voxel_num_ > BLOCK_SIZE_X) ? BLOCK_SIZE_X : voxel_num_;
 	int grid_x = (voxel_num_ - 1) / block_x + 1;
 
-	initCentroidAndCovariance<<<grid_x, block_x>>>(x_, y_, z_, starting_point_ids_, point_ids_, centroid_, covariance_, voxel_num_);
+	initCentroidAndCovariance<<<grid_x, block_x>>>(input_cloud_, starting_point_ids_, point_ids_, centroid_, covariance_, voxel_num_);
 	checkCudaErrors(cudaGetLastError());
 	checkCudaErrors(cudaDeviceSynchronize());
 
-	double *pt_sum;
+	MatrixDeviceList<double> pt_sum(3, 1, voxel_num_);
 
-	checkCudaErrors(cudaMalloc(&pt_sum, sizeof(double) * voxel_num_ * 3));
-
-	checkCudaErrors(cudaMemcpy(pt_sum, centroid_, sizeof(double) * voxel_num_ * 3, cudaMemcpyDeviceToDevice));
+	pt_sum.copy_from(centroid_);
 
 	updateVoxelCentroid<<<grid_x, block_x>>>(centroid_, points_per_voxel_, voxel_num_);
 	checkCudaErrors(cudaGetLastError());
@@ -670,12 +634,10 @@ void GVoxelGrid::computeCentroidAndCovariance()
 	checkCudaErrors(cudaGetLastError());
 	checkCudaErrors(cudaDeviceSynchronize());
 
-	checkCudaErrors(cudaFree(pt_sum));
+	pt_sum.free();
 
-	double *eigenvalues_dev, *eigenvectors_dev;
-
-	checkCudaErrors(cudaMalloc(&eigenvalues_dev, sizeof(double) * 3 * voxel_num_));
-	checkCudaErrors(cudaMalloc(&eigenvectors_dev, sizeof(double) * 9 * voxel_num_));
+	MatrixDeviceList<double> eigenvalues_dev(3, 1, voxel_num_);
+	MatrixDeviceList<double> eigenvectors_dev(3, 3, voxel_num_);
 
 	// Solving eigenvalues and eigenvectors problem by the GPU.
 	SymmetricEigensolver3x3 sv(voxel_num_);
@@ -723,24 +685,22 @@ void GVoxelGrid::computeCentroidAndCovariance()
 	}
 	checkCudaErrors(cudaDeviceSynchronize());
 
-	computeInverseCovariance<<<grid_x, block_x>>>(covariance_, inverse_covariance_, points_per_voxel_, voxel_num_, min_points_per_voxel_);
+	computeInverseCovariance<<<grid_x, block_x>>>(covariance_(0, 0), inverse_covariance_(0, 0), points_per_voxel_, voxel_num_, min_points_per_voxel_);
 	checkCudaErrors(cudaGetLastError());
 
 	checkCudaErrors(cudaDeviceSynchronize());
 
 	sv.memFree();
-	checkCudaErrors(cudaFree(eigenvalues_dev));
-	checkCudaErrors(cudaFree(eigenvectors_dev));
+	eigenvalues_dev.free();
+	eigenvectors_dev.free();
 }
 
 //Input are supposed to be in device memory
-void GVoxelGrid::setInput(float *x, float *y, float *z, int points_num)
+void GVoxelGrid::setInput(MatrixDeviceList<float> input, int points_num)
 {
 	if (points_num <= 0)
 		return;
-	x_ = x;
-	y_ = y;
-	z_ = z;
+	input_cloud_ = input;
 	points_num_ = points_num;
 
 	findBoundaries();
@@ -757,51 +717,48 @@ void GVoxelGrid::setInput(float *x, float *y, float *z, int points_num)
 }
 
 /* Find the largest coordinate values */
-extern "C"  __global__ void findMax(float *x, float *y, float *z, int full_size, int half_size)
+__global__ void findMax(MatrixDeviceList<float> input, int full_size, int half_size)
 {
 	int index = threadIdx.x + blockIdx.x * blockDim.x;
 	int stride = blockDim.x * gridDim.x;
 
 	for (int i = index; i < half_size; i += stride) {
-		x[i] = (i + half_size < full_size) ? ((x[i] >= x[i + half_size]) ? x[i] : x[i + half_size]) : x[i];
-		y[i] = (i + half_size < full_size) ? ((y[i] >= y[i + half_size]) ? y[i] : y[i + half_size]) : y[i];
-		z[i] = (i + half_size < full_size) ? ((z[i] >= z[i + half_size]) ? z[i] : z[i + half_size]) : z[i];
+		if (i + half_size < full_size) {
+			MatrixDevice<float> p = input(i);
+			MatrixDevice<float> p_other = input(i + half_size);
+
+			p(0) = (p(0) >= p_other(0)) ? p(0) : p_other(0);
+			p(1) = (p(1) >= p_other(1)) ? p(1) : p_other(1);
+			p(2) = (p(2) >= p_other(2)) ? p(2) : p_other(2);
+		}
 	}
 }
 
 /* Find the smallest coordinate values */
-extern "C"  __global__ void findMin(float *x, float *y, float *z, int full_size, int half_size)
+__global__ void findMin(MatrixDeviceList<float> input, int full_size, int half_size)
 {
 	int index = threadIdx.x + blockIdx.x * blockDim.x;
 	int stride = blockDim.x * gridDim.x;
 
 	for (int i = index; i < half_size; i += stride) {
-		x[i] = (i + half_size < full_size) ? ((x[i] <= x[i + half_size]) ? x[i] : x[i + half_size]) : x[i];
-		y[i] = (i + half_size < full_size) ? ((y[i] <= y[i + half_size]) ? y[i] : y[i + half_size]) : y[i];
-		z[i] = (i + half_size < full_size) ? ((z[i] <= z[i + half_size]) ? z[i] : z[i + half_size]) : z[i];
+		if (i + half_size < full_size) {
+			MatrixDevice<float> p = input(i);
+			MatrixDevice<float> p_other = input(i + half_size);
+
+			p(0) = (p(0) <= p_other(0)) ? p(0) : p_other(0);
+			p(1) = (p(1) <= p_other(1)) ? p(1) : p_other(1);
+			p(2) = (p(2) <= p_other(2)) ? p(2) : p_other(2);
+		}
 	}
 }
 
 
 void GVoxelGrid::findBoundaries()
 {
-	float *max_x, *max_y, *max_z, *min_x, *min_y, *min_z;
+	MatrixDeviceList<float> max(3, 1, points_num_), min(3, 1, points_num_);
 
-	checkCudaErrors(cudaMalloc(&max_x, sizeof(float) * points_num_));
-	checkCudaErrors(cudaMalloc(&max_y, sizeof(float) * points_num_));
-	checkCudaErrors(cudaMalloc(&max_z, sizeof(float) * points_num_));
-	checkCudaErrors(cudaMalloc(&min_x, sizeof(float) * points_num_));
-	checkCudaErrors(cudaMalloc(&min_y, sizeof(float) * points_num_));
-	checkCudaErrors(cudaMalloc(&min_z, sizeof(float) * points_num_));
-
-	checkCudaErrors(cudaMemcpy(max_x, x_, sizeof(float) * points_num_, cudaMemcpyDeviceToDevice));
-	checkCudaErrors(cudaMemcpy(max_y, y_, sizeof(float) * points_num_, cudaMemcpyDeviceToDevice));
-	checkCudaErrors(cudaMemcpy(max_z, z_, sizeof(float) * points_num_, cudaMemcpyDeviceToDevice));
-
-	checkCudaErrors(cudaMemcpy(min_x, x_, sizeof(float) * points_num_, cudaMemcpyDeviceToDevice));
-	checkCudaErrors(cudaMemcpy(min_y, y_, sizeof(float) * points_num_, cudaMemcpyDeviceToDevice));
-	checkCudaErrors(cudaMemcpy(min_z, z_, sizeof(float) * points_num_, cudaMemcpyDeviceToDevice));
-
+	max.copy_from(input_cloud_);
+	min.copy_from(input_cloud_);
 	int points_num = points_num_;
 
 	while (points_num > 1) {
@@ -809,10 +766,10 @@ void GVoxelGrid::findBoundaries()
 		int block_x = (half_points_num > BLOCK_SIZE_X) ? BLOCK_SIZE_X : half_points_num;
 		int grid_x = (half_points_num - 1) / block_x + 1;
 
-		findMax<<<grid_x, block_x>>>(max_x, max_y, max_z, points_num, half_points_num);
+		findMax<<<grid_x, block_x>>>(max, points_num, half_points_num);
 		checkCudaErrors(cudaGetLastError());
 
-		findMin<<<grid_x, block_x>>>(min_x, min_y, min_z, points_num, half_points_num);
+		findMin<<<grid_x, block_x>>>(min, points_num, half_points_num);
 		checkCudaErrors(cudaGetLastError());
 
 		points_num = half_points_num;
@@ -820,13 +777,13 @@ void GVoxelGrid::findBoundaries()
 
 	checkCudaErrors(cudaDeviceSynchronize());
 
-	checkCudaErrors(cudaMemcpy(&max_x_, max_x, sizeof(float), cudaMemcpyDeviceToHost));
-	checkCudaErrors(cudaMemcpy(&max_y_, max_y, sizeof(float), cudaMemcpyDeviceToHost));
-	checkCudaErrors(cudaMemcpy(&max_z_, max_z, sizeof(float), cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(&max_x_, max(0, 0), sizeof(float), cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(&max_y_, max(0, 0) + points_num_, sizeof(float), cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(&max_z_, max(0, 0) + points_num_ * 2, sizeof(float), cudaMemcpyDeviceToHost));
 
-	checkCudaErrors(cudaMemcpy(&min_x_, min_x, sizeof(float), cudaMemcpyDeviceToHost));
-	checkCudaErrors(cudaMemcpy(&min_y_, min_y, sizeof(float), cudaMemcpyDeviceToHost));
-	checkCudaErrors(cudaMemcpy(&min_z_, min_z, sizeof(float), cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(&min_x_, min(0, 0), sizeof(float), cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(&min_y_, min(0, 0) + points_num_, sizeof(float), cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(&min_z_, min(0, 0) + points_num_ * 2, sizeof(float), cudaMemcpyDeviceToHost));
 
 	max_b_x_ = static_cast<int> (floor(max_x_ / voxel_x_));
 	max_b_y_ = static_cast<int> (floor(max_y_ / voxel_y_));
@@ -840,32 +797,28 @@ void GVoxelGrid::findBoundaries()
 	vgrid_y_ = max_b_y_ - min_b_y_ + 1;
 	vgrid_z_ = max_b_z_ - min_b_z_ + 1;
 
-	checkCudaErrors(cudaFree(max_x));
-	checkCudaErrors(cudaFree(max_y));
-	checkCudaErrors(cudaFree(max_z));
-
-	checkCudaErrors(cudaFree(min_x));
-	checkCudaErrors(cudaFree(min_y));
-	checkCudaErrors(cudaFree(min_z));
+	max.free();
+	min.free();
 }
 
 /* Find indexes idx, idy and idz of candidate voxels */
-extern "C"  __global__ void findBoundariesOfCandidateVoxels(float *x, float *y, float *z,
-																float radius, int points_num,
-																float voxel_x, float voxel_y, float voxel_z,
-																int max_b_x, int max_b_y, int max_b_z,
-																int min_b_x, int min_b_y, int min_b_z,
-																int *max_vid_x, int *max_vid_y, int *max_vid_z,
-																int *min_vid_x, int *min_vid_y, int *min_vid_z,
-																int *candidate_voxel_per_point)
+__global__ void findBoundariesOfCandidateVoxels(MatrixDeviceList<float> query_points,
+													float radius, int points_num,
+													float voxel_x, float voxel_y, float voxel_z,
+													int max_b_x, int max_b_y, int max_b_z,
+													int min_b_x, int min_b_y, int min_b_z,
+													int *max_vid_x, int *max_vid_y, int *max_vid_z,
+													int *min_vid_x, int *min_vid_y, int *min_vid_z,
+													int *candidate_voxel_per_point)
 {
 	int id = threadIdx.x + blockIdx.x * blockDim.x;
 	int stride = blockDim.x * gridDim.x;
 
 	for (int i = id; i < points_num; i += stride) {
-		float t_x = x[i];
-		float t_y = y[i];
-		float t_z = z[i];
+		MatrixDevice<float> p = query_points(i);
+		float t_x = p(0);
+		float t_y = p(1);
+		float t_z = p(2);
 
 		int max_id_x = static_cast<int>(floorf((t_x + radius) / voxel_x));
 		int max_id_y = static_cast<int>(floorf((t_y + radius) / voxel_y));
@@ -903,7 +856,7 @@ extern "C"  __global__ void findBoundariesOfCandidateVoxels(float *x, float *y, 
 }
 
 /* Write id of valid points to the output buffer */
-extern "C"  __global__ void collectValidPoints(int *valid_points_mark, int *valid_points_id, int *valid_points_location, int points_num)
+__global__ void collectValidPoints(int *valid_points_mark, int *valid_points_id, int *valid_points_location, int points_num)
 {
 	for (int index = threadIdx.x + blockIdx.x * blockDim.x; index < points_num; index += blockDim.x * gridDim.x) {
 		if (valid_points_mark[index] != 0) {
@@ -960,24 +913,25 @@ extern "C"  __global__ void updateCandidateVoxelIds(int points_num,
  *
  * The valid_voxel_count store the number of true neighbor voxels.
  */
-extern "C" __global__ void inspectCandidateVoxels(float *x, float *y, float *z,
-													float radius, int max_nn, int points_num,
-													double *centroid, int *points_per_voxel, int offset,
-													int *starting_voxel_id, int *candidate_voxel_id,
-													int *valid_voxel_mark, int *valid_voxel_count, int *valid_points_mark)
+__global__ void inspectCandidateVoxels(MatrixDeviceList<float> query_points,
+											float radius, int max_nn, int points_num,
+											MatrixDeviceList<double> centroid, int *points_per_voxel, int offset,
+											int *starting_voxel_id, int *candidate_voxel_id,
+											int *valid_voxel_mark, int *valid_voxel_count, int *valid_points_mark)
 {
 	int id = threadIdx.x + blockIdx.x * blockDim.x;
 	int stride = blockDim.x * gridDim.x;
 
 	for (int i = id; i < points_num; i += stride) {
-		double t_x = static_cast<double>(x[i]);
-		double t_y = static_cast<double>(y[i]);
-		double t_z = static_cast<double>(z[i]);
+		MatrixDevice<float> qp = query_points(i);
+		double t_x = static_cast<double>(qp(0));
+		double t_y = static_cast<double>(qp(1));
+		double t_z = static_cast<double>(qp(2));
 
 		int nn = 0;
 		for (int j = starting_voxel_id[i]; j < starting_voxel_id[i + 1] && nn <= max_nn; j++) {
 			int point_num = points_per_voxel[candidate_voxel_id[j]];
-			MatrixDevice centr(3, 1, offset, centroid + candidate_voxel_id[j]);
+			MatrixDevice<double> centr = centroid(candidate_voxel_id[j]);
 
 			double centroid_x = (point_num > 0) ? (t_x - centr(0)) : radius + 1;
 			double centroid_y = (point_num > 0) ? (t_y - centr(1)) : 0;
@@ -1035,7 +989,7 @@ void GVoxelGrid::ExclusiveScan(T *input, int ele_num)
 	checkCudaErrors(cudaDeviceSynchronize());
 }
 
-void GVoxelGrid::radiusSearch(float *qx, float *qy, float *qz, int points_num, float radius, int max_nn,
+void GVoxelGrid::radiusSearch(MatrixDeviceList<float> query_points, int points_num, float radius, int max_nn,
 										int **valid_points, int **starting_voxel_id, int **valid_voxel_id,
 										int *valid_voxel_num, int *valid_points_num)
 {
@@ -1061,7 +1015,7 @@ void GVoxelGrid::radiusSearch(float *qx, float *qy, float *qz, int points_num, f
 
 	checkCudaErrors(cudaMalloc(&candidate_voxel_num_per_point, sizeof(int) * (points_num + 1)));
 
-	findBoundariesOfCandidateVoxels<<<grid_x, block_x>>>(qx, qy, qz, radius, points_num,
+	findBoundariesOfCandidateVoxels<<<grid_x, block_x>>>(query_points, radius, points_num,
 															voxel_x_, voxel_y_, voxel_z_,
 															max_b_x_, max_b_y_, max_b_z_,
 															min_b_x_, min_b_y_, min_b_z_,
@@ -1126,7 +1080,7 @@ void GVoxelGrid::radiusSearch(float *qx, float *qy, float *qz, int points_num, f
 	grid_x = (total_candidate_voxel_num - 1) / block_x + 1;
 
 	///CHECK VALID VOXEL COUNT AGAIN
-	inspectCandidateVoxels<<<grid_x, block_x>>>(qx, qy, qz, radius, max_nn, points_num,
+	inspectCandidateVoxels<<<grid_x, block_x>>>(query_points, radius, max_nn, points_num,
 													centroid_, points_per_voxel_, voxel_num_,
 													candidate_voxel_num_per_point, candidate_voxel_id,
 													valid_voxel_mark, valid_voxel_count, valid_points_mark);
@@ -1266,9 +1220,9 @@ void GVoxelGrid::radiusSearch(float *qx, float *qy, float *qz, int points_num, f
 }
 
 /* Build parent nodes from child nodes of the octree */
-extern "C" __global__ void buildParent(double *child_centroids, int *points_per_child,
+__global__ void buildParent(MatrixDeviceList<double> child_centroids, int *points_per_child,
 										int child_grid_x, int child_grid_y, int child_grid_z, int child_num,
-										double *parent_centroids, int *points_per_parent,
+										MatrixDeviceList<double> parent_centroids, int *points_per_parent,
 										int parent_grid_x, int parent_grid_y, int parent_grid_z)
 {
 	int idx = threadIdx.x + blockIdx.x * blockDim.x;
@@ -1277,7 +1231,7 @@ extern "C" __global__ void buildParent(double *child_centroids, int *points_per_
 
 	if (idx < parent_grid_x && idy < parent_grid_y && idz < parent_grid_z) {
 		int parent_idx = idx + idy * parent_grid_x + idz * parent_grid_x * parent_grid_y;
-		MatrixDevice parent_centr(3, 1, parent_grid_x * parent_grid_y * parent_grid_z, parent_centroids + parent_idx);
+		MatrixDevice<double> parent_centr = parent_centroids(parent_idx);
 		double pc0, pc1, pc2;
 		int points_num = 0;
 		double dpoints_num;
@@ -1290,15 +1244,16 @@ extern "C" __global__ void buildParent(double *child_centroids, int *points_per_
 			for (int j = idy * 2; j < idy * 2 + 2 && j < child_grid_y; j++) {
 				for (int k = idz * 2; k < idz * 2 + 2 && k < child_grid_z; k++) {
 					int child_idx = i + j * child_grid_x + k * child_grid_x * child_grid_y;
-					MatrixDevice child_centr(3, 1, child_num, child_centroids + child_idx);
+					MatrixDevice<double> child_centr = child_centroids(child_idx);
 					int child_points = points_per_child[child_idx];
 					double dchild_points = static_cast<double>(child_points);
 
-
-					pc0 += (child_points > 0) ? dchild_points * child_centr(0) : 0.0;
-					pc1 += (child_points > 0) ? dchild_points * child_centr(1) : 0.0;
-					pc2 += (child_points > 0) ? dchild_points * child_centr(2) : 0.0;
-					points_num += (child_points > 0) ? child_points : 0;
+					if (child_points > 0) {
+						pc0 += dchild_points * child_centr(0);
+						pc1 += dchild_points * child_centr(1);
+						pc2 += dchild_points * child_centr(2);
+						points_num += child_points;
+					}
 
 					__syncthreads();
 				}
@@ -1315,20 +1270,18 @@ extern "C" __global__ void buildParent(double *child_centroids, int *points_per_
 }
 
 /* Compute the number of points per voxel using atomicAdd */
-extern "C"  __global__ void insertPointsToGrid(float *x, float *y, float *z, int points_num,
-												int *points_per_voxel, int voxel_num,
-												int vgrid_x, int vgrid_y, int vgrid_z,
-												float voxel_x, float voxel_y, float voxel_z,
-												int min_b_x, int min_b_y, int min_b_z)
+__global__ void insertPointsToGrid(MatrixDeviceList<float> points, int points_num,
+									int *points_per_voxel, int voxel_num,
+									int vgrid_x, int vgrid_y, int vgrid_z,
+									float voxel_x, float voxel_y, float voxel_z,
+									int min_b_x, int min_b_y, int min_b_z)
 {
 	int index = threadIdx.x + blockIdx.x * blockDim.x;
 	int stride = blockDim.x * gridDim.x;
 
 	for (int i = index; i < points_num; i += stride) {
-		float t_x = x[i];
-		float t_y = y[i];
-		float t_z = z[i];
-		int voxel_id = voxelId(t_x, t_y, t_z, voxel_x, voxel_y, voxel_z, min_b_x, min_b_y, min_b_z, vgrid_x, vgrid_y, vgrid_z);
+		MatrixDevice<float> p = points(i);
+		int voxel_id = voxelId(p(0), p(1), p(2), voxel_x, voxel_y, voxel_z, min_b_x, min_b_y, min_b_z, vgrid_x, vgrid_y, vgrid_z);
 
 		// Update number of points in the voxel
 		int ptr_increment = (voxel_id < voxel_num) * voxel_id; // if (voxel_id < voxel_num), then use voxel_id
@@ -1339,22 +1292,22 @@ extern "C"  __global__ void insertPointsToGrid(float *x, float *y, float *z, int
 }
 
 /* Rearrange points to locations corresponding to voxels */
-extern "C" __global__ void scatterPointsToVoxels(float *x, float *y, float *z, int points_num, int voxel_num,
-													float voxel_x, float voxel_y, float voxel_z,
-													int min_b_x, int min_b_y, int min_b_z,
-													int vgrid_x, int vgrid_y, int vgrid_z,
-													int *writing_locations, int *point_ids)
+__global__ void scatterPointsToVoxels(MatrixDeviceList<float> points, int points_num, int voxel_num,
+										float voxel_x, float voxel_y, float voxel_z,
+										int min_b_x, int min_b_y, int min_b_z,
+										int vgrid_x, int vgrid_y, int vgrid_z,
+										int *writing_locations, int *point_ids)
 {
 	int idx = threadIdx.x + blockIdx.x * blockDim.x;
 	int stride = blockDim.x * gridDim.x;
 
 	for (int i = idx; i < points_num; i += stride) {
-		int voxel_id = voxelId(x[i], y[i], z[i], voxel_x, voxel_y, voxel_z,
+		MatrixDevice<float> p = points(i);
+		int voxel_id = voxelId(p(0), p(1), p(2), voxel_x, voxel_y, voxel_z,
 								min_b_x, min_b_y, min_b_z, vgrid_x, vgrid_y, vgrid_z);
 
 		int ptr_increment = (voxel_id < voxel_num) * voxel_id;
 		int incremental_value = (voxel_id < voxel_num);
-		//int loc = atomicAdd(writing_locations + voxel_id, 1);
 		int loc =  atomicAdd(writing_locations + ptr_increment, incremental_value);
 
 		point_ids[loc] = i;
@@ -1376,7 +1329,7 @@ void GVoxelGrid::scatterPointsToVoxelGrid()
 	int block_x = (points_num_ > BLOCK_SIZE_X) ? BLOCK_SIZE_X : points_num_;
 	int grid_x = (points_num_ - 1) / block_x + 1;
 
-	insertPointsToGrid<<<grid_x, block_x>>>(x_, y_, z_, points_num_, points_per_voxel_, voxel_num_,
+	insertPointsToGrid<<<grid_x, block_x>>>(input_cloud_, points_num_, points_per_voxel_, voxel_num_,
 												vgrid_x_, vgrid_y_, vgrid_z_,
 												voxel_x_, voxel_y_, voxel_z_,
 												min_b_x_, min_b_y_, min_b_z_);
@@ -1397,7 +1350,7 @@ void GVoxelGrid::scatterPointsToVoxelGrid()
 
 	checkCudaErrors(cudaMalloc(&point_ids_, sizeof(int) * points_num_));
 
-	scatterPointsToVoxels<<<grid_x, block_x>>>(x_, y_, z_, points_num_, voxel_num_,
+	scatterPointsToVoxels<<<grid_x, block_x>>>(input_cloud_, points_num_, voxel_num_,
 												voxel_x_, voxel_y_, voxel_z_,
 												min_b_x_, min_b_y_, min_b_z_,
 												vgrid_x_, vgrid_y_, vgrid_z_,
@@ -1411,10 +1364,8 @@ void GVoxelGrid::scatterPointsToVoxelGrid()
 void GVoxelGrid::buildOctree()
 {
 	for (unsigned int i = 1; i < octree_centroids_.size(); i++) {
-		if (octree_centroids_[i] != NULL) {
-			checkCudaErrors(cudaFree(octree_centroids_[i]));
-			octree_centroids_[i] = NULL;
-		}
+		octree_centroids_[i].free();
+
 		if (octree_points_per_node_[i] != NULL) {
 			checkCudaErrors(cudaFree(octree_points_per_node_[i]));
 			octree_points_per_node_[i] = NULL;
@@ -1453,13 +1404,12 @@ void GVoxelGrid::buildOctree()
 
 		node_number = parent_grid_x * parent_grid_y * parent_grid_z;
 
-		double *parent_centroids;
+		MatrixDeviceList<double> parent_centroids(3, 1, node_number);
 		int *points_per_parent;
 
-		checkCudaErrors(cudaMalloc(&parent_centroids, sizeof(double) * 3 * node_number));
 		checkCudaErrors(cudaMalloc(&points_per_parent, sizeof(int) * node_number));
 
-		double *child_centroids = octree_centroids_[i];
+		MatrixDeviceList<double> child_centroids = octree_centroids_[i];
 		int *points_per_child = octree_points_per_node_[i];
 
 		int block_x = (parent_grid_x > BLOCK_X) ? BLOCK_X : parent_grid_x;
@@ -1494,23 +1444,24 @@ void GVoxelGrid::buildOctree()
 }
 
 /* Search for the nearest octree node */
-extern "C" __global__ void nearestOctreeNodeSearch(float *x, float *y, float *z,
-													int *vid_x, int *vid_y, int *vid_z,
-													int points_num,
-													double *centroids, int *points_per_node,
-													int vgrid_x, int vgrid_y, int vgrid_z, int node_num)
+__global__ void nearestOctreeNodeSearch(MatrixDeviceList<float> query_points,
+											int *vid_x, int *vid_y, int *vid_z,
+											int points_num,
+											MatrixDeviceList<double> centroids, int *points_per_node,
+											int vgrid_x, int vgrid_y, int vgrid_z, int node_num)
 {
 	int idx = threadIdx.x + blockIdx.x * blockDim.x;
 	int stride = blockDim.x * gridDim.x;
 
 	for (int i = idx; i < points_num; i += stride) {
+		MatrixDevice<float> qp = query_points(i);
 		int vx = vid_x[i];
 		int vy = vid_y[i];
 		int vz = vid_z[i];
 		double min_dist = DBL_MAX;
-		double t_x = static_cast<double>(x[i]);
-		double t_y = static_cast<double>(y[i]);
-		double t_z = static_cast<double>(z[i]);
+		double t_x = static_cast<double>(qp(0));
+		double t_y = static_cast<double>(qp(1));
+		double t_z = static_cast<double>(qp(2));
 		double cur_dist;
 
 		int out_x, out_y, out_z;
@@ -1525,7 +1476,7 @@ extern "C" __global__ void nearestOctreeNodeSearch(float *x, float *y, float *z,
 			for (int k = vy * 2; k < vy * 2 + 2 && k < vgrid_y; k++) {
 				for (int l = vz * 2; l < vz * 2 + 2 && l < vgrid_z; l++) {
 					int node_id = j + k * vgrid_x + l * vgrid_x * vgrid_y;
-					MatrixDevice node_centr(3, 1, node_num, centroids + node_id);
+					MatrixDevice<double> node_centr = centroids(node_id);
 					int points = points_per_node[node_id];
 
 					tmp_x = (points > 0) ? node_centr(0) - t_x : DBL_MAX;
@@ -1551,8 +1502,8 @@ extern "C" __global__ void nearestOctreeNodeSearch(float *x, float *y, float *z,
 }
 
 /* Search for the nearest point from nearest voxel */
-extern "C" __global__ void nearestPointSearch(float *qx, float *qy, float *qz, int qpoints_num,
-												float *rx, float *ry, float *rz, int rpoints_num,
+__global__ void nearestPointSearch(MatrixDeviceList<float> qpoints, int qpoints_num,
+												MatrixDeviceList<float> rpoints, int rpoints_num,
 												int *vid_x, int *vid_y, int *vid_z,
 												int vgrid_x, int vgrid_y, int vgrid_z, int voxel_num,
 												int *starting_point_id, int *point_id, double *min_distance)
@@ -1562,22 +1513,17 @@ extern "C" __global__ void nearestPointSearch(float *qx, float *qy, float *qz, i
 
 	for (int i = idx; i < qpoints_num; i += stride) {
 		int voxel_id = vid_x[i] + vid_y[i] * vgrid_x + vid_z[i] * vgrid_x * vgrid_y;
-		float cor_qx = qx[i];
-		float cor_qy = qy[i];
-		float cor_qz = qz[i];
+		MatrixDevice<float> qp = qpoints(i);
+		float cor_qx = qp(0);
+		float cor_qy = qp(1);
+		float cor_qz = qp(2);
 		float min_dist = FLT_MAX;
 
 		for (int j = starting_point_id[voxel_id]; j < starting_point_id[voxel_id + 1]; j++) {
 			int pid = point_id[j];
-			float cor_rx = rx[pid];
-			float cor_ry = ry[pid];
-			float cor_rz = rz[pid];
+			MatrixDevice<float> rp = rpoints(pid);
 
-			cor_rx -= cor_qx;
-			cor_ry -= cor_qy;
-			cor_rz -= cor_qz;
-
-			min_dist = fminf(norm3df(cor_rx, cor_ry, cor_rz), min_dist);
+			min_dist = fminf(norm3df(rp(0) - cor_qx, rp(1) - cor_qy, rp(2) - cor_qz), min_dist);
 		}
 
 		min_distance[i] = static_cast<double>(min_dist);
@@ -1601,7 +1547,7 @@ extern "C" __global__ void verifyDistances(int *valid_distance, double *min_dist
 	}
 }
 
-void GVoxelGrid::nearestNeighborSearch(float *trans_x, float *trans_y, float *trans_z, int point_num, int *valid_distance, double *min_distance, float max_range)
+void GVoxelGrid::nearestNeighborSearch(MatrixDeviceList<float> query_points, int point_num, int *valid_distance, double *min_distance, float max_range)
 {
 
 	int *vid_x, *vid_y, *vid_z;
@@ -1620,14 +1566,14 @@ void GVoxelGrid::nearestNeighborSearch(float *trans_x, float *trans_y, float *tr
 
 	// Go through top of the octree to the bottom
 	for (int i = octree_centroids_.size() - 1; i >= 0; i--) {
-		double *centroids = octree_centroids_[i];
+		MatrixDeviceList<double> centroids = octree_centroids_[i];
 		int *points_per_node = octree_points_per_node_[i];
 		int vgrid_x = octree_grid_size_[i].size_x;
 		int vgrid_y = octree_grid_size_[i].size_y;
 		int vgrid_z = octree_grid_size_[i].size_z;
 		int node_num = vgrid_x * vgrid_y * vgrid_z;
 
-		nearestOctreeNodeSearch<<<grid_x, block_x>>>(trans_x, trans_y, trans_z,
+		nearestOctreeNodeSearch<<<grid_x, block_x>>>(query_points,
 														vid_x, vid_y, vid_z,
 														point_num,
 														centroids, points_per_node,
@@ -1635,8 +1581,8 @@ void GVoxelGrid::nearestNeighborSearch(float *trans_x, float *trans_y, float *tr
 		checkCudaErrors(cudaGetLastError());
 	}
 
-	nearestPointSearch<<<grid_x, block_x>>>(trans_x, trans_y, trans_z, point_num,
-												x_, y_, z_, points_num_,
+	nearestPointSearch<<<grid_x, block_x>>>(query_points, point_num,
+												input_cloud_, points_num_,
 												vid_x, vid_y, vid_z,
 												vgrid_x_, vgrid_y_, vgrid_z_, voxel_num_,
 												starting_point_ids_, point_ids_,

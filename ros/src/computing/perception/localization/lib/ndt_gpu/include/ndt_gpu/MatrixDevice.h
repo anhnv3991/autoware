@@ -2,73 +2,80 @@
 #define MATRIX_DEVICE_H_
 
 #include "Matrix.h"
+#include <iostream>
 
 namespace gpu {
-class MatrixDevice : public Matrix {
+template <typename Scalar, int Rows, int Cols>
+class MatrixDevice : public Matrix<Scalar, Rows, Cols> {
 public:
-	CUDAH MatrixDevice();
+	MatrixDevice();
 
-	MatrixDevice(int rows, int cols);
+	CUDAH MatrixDevice(int offset, Scalar *buffer) :  Matrix<Scalar, Rows, Cols>(offset, buffer){}
 
-	CUDAH MatrixDevice(int rows, int cols, int offset, double *buffer);
+	CUDAH MatrixDevice(const MatrixDevice<Scalar, Rows, Cols> &other) {
+		buffer_ = other.buffer_;
+		offset_ = other.offset_;
+		is_copied_ = true;
+	}
 
-	CUDAH bool isEmpty();
+	CUDAH bool isEmpty() {
+		return (Rows == 0 || Cols == 0 || buffer_ == NULL);
+	}
 
-	CUDAH MatrixDevice col(int index);
+	CUDAH MatrixDevice<Scalar, Rows, 1> col(int index) {
+		return MatrixDevice<Scalar, Rows, 1>(offset_ * Cols, buffer_ + index * offset_);
+	}
 
-	CUDAH MatrixDevice row(int index);
+	CUDAH MatrixDevice<Scalar, 1, Cols> row(int index) {
+		return MatrixDevice<Scalar, 1, Cols>(offset_, buffer_ + index * Cols * offset_);
+	}
 
-	CUDAH void setBuffer(double *buffer);
+	CUDAH MatrixDevice<Scalar, RSize, 1> col(int row, int col, int rsize) {
+		return MatrixDevice<Scalar, RSize, 1>(offset_ * Cols, buffer_ + (row * Cols + col) * offset_);
+	}
 
-	void memAlloc();
+	// Extract a row of CSize elements from (row, col)
+	CUDAH MatrixDevice<Scalar, 1, CSize> row(int row, int col) {
+		return MatrixDevice<Scalar, 1, CSize>(offset_, buffer_ + (row * Cols + col) * offset_);
+	}
 
-	void memFree();
+	CUDAH MatrixDevice<Scalar, Rows, Cols>& operator=(const MatrixDevice<Scalar, Rows, Cols> &other) {
+		buffer_ = other.buffer_;
+		offset_ = other.offset_;
+		is_copied_ = true;
 
+		return *this;
+	}
+
+	CUDAH MatrixDevice<Scalar, Rows, Cols>& operator=(MatrixDevice<Scalar, Rows, Cols> &&other) {
+		buffer_ = other.buffer_;
+		offset_ = other.offset_;
+		is_copied_ = false;
+
+		other.buffer_ = nullptr;
+		other.offset_ = 0;
+		other.is_copied_ = true;
+
+		return *this;
+	}
+
+	CUDAH void copy_from(const MatrixDevice<Scalar, Rows, Cols> &other) {
+#pragma unroll 1
+		for (int i = 0; i < Rows; i++) {
+#pragma unroll 1
+			for (int j = 0; j < Cols; j++) {
+				buffer_[(i * Cols + j) * offset_] = other.at(i, j);
+			}
+		}
+	}
+
+	CUDAH void setBuffer(Scalar *buffer) { buffer_ = buffer; }
+
+	void free();
 private:
-	bool fr_;
-};
-
-CUDAH MatrixDevice::MatrixDevice()
-{
-	rows_ = cols_ = offset_ = 0;
-	buffer_ = NULL;
-	fr_ = true;
-}
-
-CUDAH MatrixDevice::MatrixDevice(int rows, int cols, int offset, double *buffer)
-{
-	rows_ = rows;
-	cols_ = cols;
-	offset_ = offset;
-	buffer_ = buffer;
-	fr_ = false;
-}
-
-CUDAH bool MatrixDevice::isEmpty()
-{
-	return (rows_ == 0 || cols_ == 0 || buffer_ == NULL);
-}
-
-CUDAH MatrixDevice MatrixDevice::col(int index)
-{
-	return MatrixDevice(rows_, 1, offset_ * cols_, buffer_ + index * offset_);
-}
-
-CUDAH MatrixDevice MatrixDevice::row(int index)
-{
-	return MatrixDevice(1, cols_, offset_, buffer_ + index * cols_ * offset_);
-}
-
-CUDAH void MatrixDevice::setBuffer(double *buffer)
-{
-	buffer_ = buffer;
-}
-
-
-
-class SquareMatrixDevice : public MatrixDevice {
-public:
-	SquareMatrixDevice(int size);
+	using Matrix<Scalar, Rows, Cols>::buffer_;
+	using Matrix<Scalar, Rows, Cols>::offset_;
+	using Matrix<Scalar, Rows, Cols>::is_copied_;
 };
 
 }

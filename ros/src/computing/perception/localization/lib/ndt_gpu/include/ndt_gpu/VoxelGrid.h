@@ -7,6 +7,7 @@
 #include "common.h"
 #include "MatrixDevice.h"
 #include "MatrixHost.h"
+#include "MatrixDeviceList.h"
 #include <float.h>
 #include <vector>
 
@@ -18,7 +19,7 @@ public:
 	GVoxelGrid(const GVoxelGrid &other);
 
 	/* Set input points */
-	void setInput(float *x, float *y, float *z, int points_num);
+	void setInput(MatrixDeviceList<float> input, int points_num);
 
 	void setMinVoxelSize(int size);
 
@@ -31,7 +32,7 @@ public:
 	 * The number of valid points is stored in valid_points_num.
 	 * The total number of valid voxels. If the query of both point A and point B return
 	 * voxel X, then the number of valid voxels is 2, not 1. */
-	void radiusSearch(float *qx, float *qy, float *qz, int points_num, float radius, int max_nn,
+	void radiusSearch(MatrixDeviceList<float> query_points, int points_num, float radius, int max_nn,
 											int **valid_points, int **starting_voxel_id, int **voxel_id,
 											int *valid_voxel_num, int *valid_points_num);
 
@@ -64,13 +65,13 @@ public:
 	void setLeafSize(float voxel_x, float voxel_y, float voxel_z);
 
 	/* Get the centroid list. */
-	double *getCentroidList() const;
+	MatrixDeviceList<double> getCentroidList() const;
 
 	/* Get the covariance list. */
-	double *getCovarianceList() const;
+	MatrixDeviceList<double> getCovarianceList() const;
 
 	/* Get the pointer to the inverse covariances list. */
-	double *getInverseCovarianceList() const;
+	MatrixDeviceList<double> getInverseCovarianceList() const;
 
 	int *getPointsPerVoxelList() const;
 
@@ -82,7 +83,7 @@ public:
 	 * The ith element of min_distance array stores the distance between
 	 * the corresponding input point and its nearest neighbor. It is 0 if
 	 * the distance is larger than max_range. */
-	void nearestNeighborSearch(float *trans_x, float *trans_y, float *trans_z, int point_num, int *valid_distance, double *min_distance, float max_range);
+	void nearestNeighborSearch(MatrixDeviceList<float> query_points, int point_num, int *valid_distance, double *min_distance, float max_range);
 
 	~GVoxelGrid();
 private:
@@ -126,11 +127,11 @@ private:
 	} OctreeGridSize;
 
 	//Coordinate of input points
-	float *x_, *y_, *z_;
+	MatrixDeviceList<float> input_cloud_;
 	int points_num_;
-	double *centroid_; 				// List of 3x1 double vector
-	double *covariance_;			// List of 3x3 double matrix
-	double *inverse_covariance_;	// List of 3x3 double matrix
+	MatrixDeviceList<double> centroid_; 				// List of 3x1 double vector
+	MatrixDeviceList<double> covariance_;			// List of 3x3 double matrix
+	MatrixDeviceList<double> inverse_covariance_;	// List of 3x3 double matrix
 	int *points_per_voxel_;
 
 	int voxel_num_;						// Number of voxels
@@ -148,7 +149,7 @@ private:
 
 	/* Centroids of octree nodes. Each element stores a list
 	 * of 3x1 matrices containing centroids of octree nodes. */
-	std::vector<double*> octree_centroids_;
+	std::vector<MatrixDeviceList<double> > octree_centroids_;
 
 	/* The number of points per octree node per level. */
 	std::vector<int*> octree_points_per_node_;

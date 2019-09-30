@@ -12,24 +12,20 @@ SymmetricEigensolver3x3::SymmetricEigensolver3x3(int offset)
 	checkCudaErrors(cudaMalloc(&norm_, sizeof(double) * offset_));
 	checkCudaErrors(cudaMalloc(&i02_, sizeof(int) * 2 * offset_));
 
-	eigenvectors_ = NULL;
-	eigenvalues_ = NULL;
-	input_matrices_ = NULL;
-
 	is_copied_ = false;
 }
 
-void SymmetricEigensolver3x3::setInputMatrices(double *input_matrices)
+void SymmetricEigensolver3x3::setInputMatrices(MatrixDeviceList<double> input_matrices)
 {
 	input_matrices_ = input_matrices;
 }
 
-void SymmetricEigensolver3x3::setEigenvectors(double *eigenvectors)
+void SymmetricEigensolver3x3::setEigenvectors(MatrixDeviceList<double> eigenvectors)
 {
 	eigenvectors_ = eigenvectors;
 }
 
-void SymmetricEigensolver3x3::setEigenvalues(double *eigenvalues)
+void SymmetricEigensolver3x3::setEigenvalues(MatrixDeviceList<double> eigenvalues)
 {
 	eigenvalues_ = eigenvalues;
 }

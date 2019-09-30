@@ -4,6 +4,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include "MatrixDevice.h"
+#include "MatrixDeviceList.h"
 #include <math.h>
 
 namespace gpu {
@@ -16,11 +17,11 @@ public:
 
 	CUDAH SymmetricEigensolver3x3(const SymmetricEigensolver3x3& other);
 
-	void setInputMatrices(double *input_matrices);
+	void setInputMatrices(MatrixDeviceList<double> input_matrices);	// 3x3
 
-	void setEigenvectors(double *eigenvectors);
+	void setEigenvectors(MatrixDeviceList<double> eigenvectors);	// 3x3
 
-	void setEigenvalues(double *eigenvalues);
+	void setEigenvalues(MatrixDeviceList<double> eigenvalues); //3x1
 
 	double *getBuffer() const;
 
@@ -59,18 +60,19 @@ public:
 	void memFree();
 
 private:
-	CUDAH void computeOrthogonalComplement(MatrixDevice w, MatrixDevice u, MatrixDevice v);
+	typedef MatrixDevice<double> Vector3d;	// 3x1
+	typedef MatrixDevice<double> Matrix3d;	// 3x3
+
+	CUDAH void computeOrthogonalComplement(Vector3d &w, Vector3d &u, Vector3d &v);
 
 	//Operators
-	CUDAH void multiply(MatrixDevice u, double mult, MatrixDevice output);
+	CUDAH void multiply(Vector3d &u, double mult, Vector3d &output);
 
-	CUDAH void subtract(MatrixDevice u, MatrixDevice v, MatrixDevice output);
+	CUDAH void subtract(Vector3d &u, Vector3d &v, Vector3d &output);
 
-	CUDAH void divide(MatrixDevice u, double div, MatrixDevice output);
+	CUDAH void divide(Vector3d u, double div, Vector3d output);
 
-	CUDAH double dot(MatrixDevice u, MatrixDevice v);
-
-	CUDAH void cross(MatrixDevice in0, MatrixDevice in1, MatrixDevice out);
+	CUDAH void cross(Vector3d in0, Vector3d in1, Vector3d out);
 
 	int offset_;
 
@@ -80,9 +82,9 @@ private:
 	double *maxAbsElement_;
 	double *norm_;
 
-	double *eigenvectors_;
-	double *eigenvalues_;
-	double *input_matrices_;
+	MatrixDeviceList<double> eigenvectors_;
+	MatrixDeviceList<double> eigenvalues_;
+	MatrixDeviceList<double> input_matrices_;
 
 	bool is_copied_;
 };
@@ -91,9 +93,6 @@ private:
 CUDAH SymmetricEigensolver3x3::SymmetricEigensolver3x3()
 {
 		buffer_ = NULL;
-		eigenvectors_ = NULL;
-		eigenvalues_ = NULL;
-		input_matrices_ = NULL;
 		maxAbsElement_ = NULL;
 		norm_ = NULL;
 		i02_ = NULL;
@@ -117,7 +116,7 @@ CUDAH SymmetricEigensolver3x3::SymmetricEigensolver3x3(const SymmetricEigensolve
 
 CUDAH void SymmetricEigensolver3x3::normalizeInput(int tid)
 {
-	MatrixDevice input(3, 3, offset_, input_matrices_ + tid);
+	Matrix3d input = input_matrices_(tid);
 
 	double a00 = input(0, 0);
 	double a01 = input(0, 1);
@@ -135,7 +134,7 @@ CUDAH void SymmetricEigensolver3x3::normalizeInput(int tid)
 	maxAbsElement = (maxAbsElement > max2) ? maxAbsElement : max2;
 
 	if (maxAbsElement == 0.0) {
-		MatrixDevice evec(3, 3, offset_, eigenvectors_ + tid);
+		Matrix3d evec = eigenvectors_(tid);
 
 		evec(0, 0) = 1.0;
 		evec(1, 1) = 1.0;
@@ -171,8 +170,8 @@ CUDAH void SymmetricEigensolver3x3::normalizeInput(int tid)
 
 CUDAH void SymmetricEigensolver3x3::computeEigenvalues(int tid)
 {
-	MatrixDevice input(3, 3, offset_, input_matrices_ + tid);
-	MatrixDevice eval(3, 1, offset_, eigenvalues_ + tid);
+	Matrix3d input = input_matrices_(tid);
+	Vector3d eval = eigenvalues_(tid);
 
 	double a00 = input(0, 0);
 	double a01 = input(0, 1);
@@ -220,7 +219,7 @@ CUDAH void SymmetricEigensolver3x3::computeEigenvalues(int tid)
 CUDAH void SymmetricEigensolver3x3::updateEigenvalues(int tid)
 {
 	double maxAbsElement = maxAbsElement_[tid];
-	MatrixDevice eval(3, 1, offset_, eigenvalues_ + tid);
+	Vector3d eval = eigenvalues_(tid);
 
 	eval(0) *= maxAbsElement;
 	eval(1) *= maxAbsElement;
@@ -230,35 +229,35 @@ CUDAH void SymmetricEigensolver3x3::updateEigenvalues(int tid)
 CUDAH void SymmetricEigensolver3x3::computeEigenvector00(int tid)
 {
 	if (norm_[tid] > 0.0) {
-		MatrixDevice input(3, 3, offset_, input_matrices_ + tid);
-		MatrixDevice row_mat(3, 3, offset_, buffer_ + tid);
-		double eval0 = eigenvalues_[tid + i02_[tid] * offset_];
+		Matrix3d input = input_matrices_(tid);
+		Matrix3d row_mat(3, 3, offset_, buffer_ + tid);
+		double eval0 = eigenvalues_(tid)(i02_[tid]);
 
-		input.copy(row_mat);
+		row_mat.copy_from(input);
 
 		row_mat(0, 0) -= eval0;
 		row_mat(1, 1) -= eval0;
 		row_mat(2, 2) -= eval0;
 
 		//row0 is r0xr1, row1 is r0xr2, row2 is r1xr2
-		MatrixDevice rxr(3, 3, offset_, buffer_ + 3 * 3 * offset_ + tid);
+		Matrix3d rxr(3, 3, offset_, buffer_ + 3 * 3 * offset_ + tid);
 
 		cross(row_mat.row(0), row_mat.row(1), rxr.row(0));
 		cross(row_mat.row(0), row_mat.row(2), rxr.row(1));
 		cross(row_mat.row(1), row_mat.row(2), rxr.row(2));
 
 	} else {
-		eigenvectors_[tid] = 1.0;
+		eigenvectors_(tid, 0, 0) = 1.0;
 	}
 }
 
 CUDAH void SymmetricEigensolver3x3::computeEigenvector01(int tid)
 {
 	if (norm_[tid] > 0.0) {
-		MatrixDevice evec0(3, 1, offset_ * 3, eigenvectors_ + tid + i02_[tid] * offset_);
+		Vector3d evec0 = eigenvectors_(tid).col(i02_[tid]);
 
 		//row0 is r0xr1, row1 is r0xr2, row2 is r1xr2
-		MatrixDevice rxr(3, 3, offset_, buffer_ + 3 * 3 * offset_ + tid);
+		Matrix3d rxr(3, 3, offset_, buffer_ + 3 * 3 * offset_ + tid);
 
 
 		double d0 = rxr(0, 0) * rxr(0, 0) + rxr(0, 1) * rxr(0, 1) * rxr(0, 2) * rxr(0, 2);
@@ -278,17 +277,17 @@ CUDAH void SymmetricEigensolver3x3::computeEigenvector01(int tid)
 CUDAH void SymmetricEigensolver3x3::computeEigenvector10(int tid)
 {
 	if (norm_[tid] > 0.0) {
-		MatrixDevice input(3, 3, offset_, input_matrices_ + tid);
-		MatrixDevice evec0(3, 1, offset_ * 3, eigenvectors_ + tid + i02_[tid] * offset_);
-		double eval1 = eigenvalues_[tid + offset_];
+		Matrix3d input = input_matrices_(tid);
+		Vector3d evec0 = eigenvectors_(tid).col(i02_[tid]);
+		double eval1 = eigenvalues_(tid)(1);
 
-		MatrixDevice u(3, 1, offset_, buffer_ + tid);
-		MatrixDevice v(3, 1, offset_, buffer_ + 3 * offset_ + tid);
+		Vector3d u(3, 1, offset_, buffer_ + tid);
+		Vector3d v(3, 1, offset_, buffer_ + 3 * offset_ + tid);
 
 		computeOrthogonalComplement(evec0, u, v);
 
-		MatrixDevice au(3, 1, offset_, buffer_ + 6 * offset_ + tid);
-		MatrixDevice av(3, 1, offset_, buffer_ + 9 * offset_ + tid);
+		Vector3d au(3, 1, offset_, buffer_ + 6 * offset_ + tid);
+		Vector3d av(3, 1, offset_, buffer_ + 9 * offset_ + tid);
 
 		double t0, t1, t2;
 
@@ -308,20 +307,20 @@ CUDAH void SymmetricEigensolver3x3::computeEigenvector10(int tid)
 		av(1) = input(0, 1) * t0 + (input(1, 1) - eval1) * t1 + input(1, 2) * t2;
 		av(2) = input(0, 2) * t0 + input(1, 2) * t1 + (input(2, 2) - eval1) * t2;
 	} else {
-		eigenvectors_[tid + offset_ * 4] = 1.0;
+		eigenvectors_(tid)(1, 1) = 1.0;
 	}
 }
 
 CUDAH void SymmetricEigensolver3x3::computeEigenvector11(int tid)
 {
 	if (norm_[tid] > 0.0) {
-		MatrixDevice evec1(3, 1, offset_ * 3, eigenvectors_ + tid + offset_);
+		Vector3d evec1 = eigenvectors_(tid).col(1);
 
-		MatrixDevice u(3, 1, offset_, buffer_ + tid);
-		MatrixDevice v(3, 1, offset_, buffer_ + 3 * offset_ + tid);
+		Vector3d u(3, 1, offset_, buffer_ + tid);
+		Vector3d v(3, 1, offset_, buffer_ + 3 * offset_ + tid);
 
-		MatrixDevice au(3, 1, offset_, buffer_ + 6 * offset_ + tid);
-		MatrixDevice av(3, 1, offset_, buffer_ + 9 * offset_ + tid);
+		Vector3d au(3, 1, offset_, buffer_ + 6 * offset_ + tid);
+		Vector3d av(3, 1, offset_, buffer_ + 9 * offset_ + tid);
 
 		double m00 = u(0) * au(0) + u(1) * au(1) + u(2) * au(2);
 		double m01 = u(0) * av(0) + u(1) * av(1) + u(2) * av(2);
@@ -343,50 +342,45 @@ CUDAH void SymmetricEigensolver3x3::computeEigenvector11(int tid)
 			*large = 1.0 / sqrt(1.0 + (*small) * (*small));
 			*small *= (*large);
 
-			multiply(u, u_mult, u);
-			multiply(v, v_mult, v);
+			u *= u_mult;
+			v *= v_mult;
 			subtract(u, v, evec1);
 
 		} else {
-			u.copy(evec1);
+			evec1.copy_from(u);
 		}
 	}
 }
 
-CUDAH void SymmetricEigensolver3x3::multiply(MatrixDevice u, double mult, MatrixDevice output)
+CUDAH void SymmetricEigensolver3x3::multiply(Vector3d &u, double mult, Vector3d &output)
 {
 	output(0) = u(0) * mult;
 	output(1) = u(1) * mult;
 	output(2) = u(2) * mult;
 }
 
-CUDAH void SymmetricEigensolver3x3::subtract(MatrixDevice u, MatrixDevice v, MatrixDevice output)
+CUDAH void SymmetricEigensolver3x3::subtract(Vector3d &u, Vector3d &v, Vector3d &output)
 {
 	output(0) = u(0) - v(0);
 	output(1) = u(1) - v(1);
 	output(2) = u(2) - v(2);
 }
 
-CUDAH void SymmetricEigensolver3x3::divide(MatrixDevice u, double div, MatrixDevice output)
+CUDAH void SymmetricEigensolver3x3::divide(Vector3d u, double div, Vector3d output)
 {
 	output(0) = u(0) / div;
 	output(1) = u(1) / div;
 	output(2) = u(2) / div;
 }
 
-CUDAH double SymmetricEigensolver3x3::dot(MatrixDevice u, MatrixDevice v)
-{
-	return (u(0) * v(0) + u(1) * v(1) + u(2) * v(2));
-}
-
-CUDAH void SymmetricEigensolver3x3::cross(MatrixDevice u, MatrixDevice v, MatrixDevice out)
+CUDAH void SymmetricEigensolver3x3::cross(Vector3d u, Vector3d v, Vector3d out)
 {
 	out(0) = u(1) * v(2) - u(2) * v(1);
 	out(1) = u(2) * v(0) - u(0) * v(2);
 	out(2) = u(0) * v(1) - u(1) * v(0);
 }
 
-CUDAH void SymmetricEigensolver3x3::computeOrthogonalComplement(MatrixDevice w, MatrixDevice u, MatrixDevice v)
+CUDAH void SymmetricEigensolver3x3::computeOrthogonalComplement(Vector3d &w, Vector3d &u, Vector3d &v)
 {
 	bool c = (fabs(w(0)) > fabs(w(1)));
 
@@ -402,13 +396,13 @@ CUDAH void SymmetricEigensolver3x3::computeOrthogonalComplement(MatrixDevice w, 
 CUDAH void SymmetricEigensolver3x3::computeEigenvector2(int tid)
 {
 	if (norm_[tid] > 0.0) {
-		MatrixDevice evec0(3, 1, offset_ * 3, eigenvectors_ + tid + i02_[tid] * offset_);
-		MatrixDevice evec1(3, 1, offset_ * 3, eigenvectors_ + tid + offset_);
-		MatrixDevice evec2(3, 1, offset_ * 3, eigenvectors_ + tid + i02_[tid + offset_] * offset_);
+		Vector3d evec0 = eigenvectors_(tid).col(i02_[tid]);
+		Vector3d evec1 = eigenvectors_(tid).col(1);
+		Vector3d evec2 = eigenvectors_(tid).col(i02_[tid + offset_]);
 
 		cross(evec0, evec1, evec2);
 	} else {
-		eigenvectors_[tid + offset_ * 8] = 1.0;
+		eigenvectors_(tid)(2, 2) = 1.0;
 	}
 }
 }

@@ -6,6 +6,7 @@
 #include "Matrix.h"
 #include "MatrixHost.h"
 #include "MatrixDevice.h"
+#include "MatrixDeviceList.h"
 #include "common.h"
 #include <eigen3/Eigen/Dense>
 #include <eigen3/Eigen/Geometry>
@@ -13,12 +14,13 @@
 #include <pcl/point_cloud.h>
 
 namespace gpu {
+template <typename PointSourceType, typename PointTargetType, typename Scalar = float>
 class GRegistration {
 public:
 	GRegistration();
-	GRegistration(const GRegistration &other);
+	GRegistration(const GRegistration<PointSourceType, PointTargetType, Scalar> &other);
 
-	void align(const Eigen::Matrix<float, 4, 4> &guess);
+	void align(const Eigen::Matrix<Scalar, 4, 4> &guess);
 
 	void setTransformationEpsilon(double trans_eps);
 
@@ -28,17 +30,15 @@ public:
 
 	int getMaximumIterations() const;
 
-	Eigen::Matrix<float, 4, 4> getFinalTransformation() const;
+	Eigen::Matrix<Scalar, 4, 4> getFinalTransformation() const;
 
 	/* Set input Scanned point cloud.
 	 * Copy input points from the main memory to the GPU memory */
-	void setInputSource(pcl::PointCloud<pcl::PointXYZI>::Ptr input);
-	void setInputSource(pcl::PointCloud<pcl::PointXYZ>::Ptr input);
+	void setInputSource(typename pcl::PointCloud<PointSourceType>::Ptr input);
 
 	/* Set input reference map point cloud.
 	 * Copy input points from the main memory to the GPU memory */
-	void setInputTarget(pcl::PointCloud<pcl::PointXYZI>::Ptr input);
-	void setInputTarget(pcl::PointCloud<pcl::PointXYZ>::Ptr input);
+	void setInputTarget(typename pcl::PointCloud<PointTargetType>::Ptr input);
 
 	int getFinalNumIteration() const;
 
@@ -47,31 +47,32 @@ public:
 	virtual ~GRegistration();
 protected:
 
-	virtual void computeTransformation(const Eigen::Matrix<float, 4, 4> &guess);
+	virtual void computeTransformation(const Eigen::Matrix<Scalar, 4, 4> &guess);
 
 	double transformation_epsilon_;
 	int max_iterations_;
 
-	//Original scanned point clouds
-	float *x_, *y_, *z_;
+	//Source scanned point clouds
+	MatrixDeviceList<Scalar> source_cloud_;
 	int points_number_;
 
-	//Transformed point clouds
-	float *trans_x_, *trans_y_, *trans_z_;
+	//Transformed source point clouds
+	MatrixDeviceList<Scalar> trans_cloud_;
 
 	bool converged_;
 	int nr_iterations_;
 
-	Eigen::Matrix<float, 4, 4> final_transformation_, transformation_, previous_transformation_;
+	Eigen::Matrix<Scalar, 4, 4> final_transformation_, transformation_, previous_transformation_;
 
 	bool target_cloud_updated_;
 
-	// Reference map point
-	float *target_x_, *target_y_, *target_z_;
+	// Target cloud
+	MatrixDeviceList<Scalar> target_cloud_;
 	int target_points_number_;
 
 	bool is_copied_;
 };
+
 }
 
 #endif
